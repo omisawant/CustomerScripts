@@ -6,11 +6,12 @@ Exports Azure quota limits and current utilization to an Excel workbook.
 Uses the Azure Quota API cmdlets to collect quota limits (Get-AzQuota) and
 current usage (Get-AzQuotaUsage) for every accessible Azure subscription.
 The workbook contains a summary, one worksheet per quota resource provider,
-and an errors worksheet.
+and an errors worksheet. Only Azure regions located in the United States are
+queried.
 
-The Azure Quota API currently exposes centralized quota data for Compute,
-Network, and Machine Learning Services. Supply -QuotaProvider to query
-additional providers as support is added to the service.
+Quota availability varies by resource provider and region. Providers that do
+not expose data through the centralized Azure Quota API are recorded in the
+Errors worksheet. Supply -QuotaProvider to override the default provider list.
 
 .PARAMETER OutputPath
 Path of the .xlsx workbook to create.
@@ -20,12 +21,14 @@ Optional list of subscription IDs to include. The default is every enabled
 subscription visible to the signed-in account.
 
 .PARAMETER Location
-Optional list of Azure location names, such as eastus and westus3. The
-default is every location returned by Get-AzLocation for each subscription.
+Optional list of U.S. Azure location names, such as eastus and westus3. The
+default is every U.S. location returned by Get-AzLocation for each
+subscription. Non-U.S. and unknown locations are rejected.
 
 .PARAMETER QuotaProvider
-Resource provider namespaces to query. Defaults to the providers supported
-by the centralized Azure Quota API.
+Resource provider namespaces to query. Defaults to Compute, Network, Machine
+Learning, Storage, Container Instances, Container Apps, App Service, AI
+Search, Azure Database for PostgreSQL, and Azure Kubernetes Service.
 
 .PARAMETER WarningThresholdPercent
 Utilization percentage at which a quota row is marked Warning.
@@ -65,7 +68,14 @@ param(
     [string[]] $QuotaProvider = @(
         'Microsoft.Compute',
         'Microsoft.Network',
-        'Microsoft.MachineLearningServices'
+        'Microsoft.MachineLearningServices',
+        'Microsoft.Storage',
+        'Microsoft.ContainerInstance',
+        'Microsoft.App',
+        'Microsoft.Web',
+        'Microsoft.Search',
+        'Microsoft.DBforPostgreSQL',
+        'Microsoft.ContainerService'
     ),
 
     [Parameter()]
@@ -340,23 +350,45 @@ foreach ($subscription in $subscriptions) {
         continue
     }
 
+    try {
+        $unitedStatesLocations = @(
+            Get-AzLocation |
+                Where-Object {
+                    $_.GeographyGroup -eq 'US' -or
+                    $_.PhysicalLocation -match 'United States'
+                } |
+                Select-Object -ExpandProperty Location |
+                Sort-Object -Unique
+        )
+    }
+    catch {
+        Add-CollectionError -ErrorList $errors -Subscription $subscription `
+            -Provider '' -AzureLocation '' -Operation 'Get-AzLocation' `
+            -Message $_.Exception.Message
+        continue
+    }
+
+    if ($unitedStatesLocations.Count -eq 0) {
+        Add-CollectionError -ErrorList $errors -Subscription $subscription `
+            -Provider '' -AzureLocation '' -Operation 'Filter US locations' `
+            -Message 'Get-AzLocation returned no Azure regions in the United States.'
+        continue
+    }
+
     if ($Location) {
+        $invalidLocations = @(
+            $Location |
+                Where-Object { $_ -notin $unitedStatesLocations } |
+                Sort-Object -Unique
+        )
+        if ($invalidLocations.Count -gt 0) {
+            throw "The following locations are not recognized as U.S. Azure regions: $($invalidLocations -join ', ')"
+        }
+
         $subscriptionLocations = @($Location | Sort-Object -Unique)
     }
     else {
-        try {
-            $subscriptionLocations = @(
-                Get-AzLocation |
-                    Select-Object -ExpandProperty Location |
-                    Sort-Object -Unique
-            )
-        }
-        catch {
-            Add-CollectionError -ErrorList $errors -Subscription $subscription `
-                -Provider '' -AzureLocation '' -Operation 'Get-AzLocation' `
-                -Message $_.Exception.Message
-            continue
-        }
+        $subscriptionLocations = $unitedStatesLocations
     }
 
     $providerIndex = 0
