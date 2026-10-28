@@ -66,16 +66,27 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string[]] $QuotaProvider = @(
-        'Microsoft.Compute',
-        'Microsoft.Network',
-        'Microsoft.MachineLearningServices',
-        'Microsoft.Storage',
-        'Microsoft.ContainerInstance',
-        'Microsoft.App',
         'Microsoft.Web',
-        'Microsoft.Search',
+        'Microsoft.Automation',
+        'Microsoft.App',
+        'Microsoft.ContainerInstance',
+        'Microsoft.DBforMySQL',
+        'Microsoft.HDInsight',
+        'Microsoft.ContainerService',
+        'Microsoft.LabServices',
         'Microsoft.DBforPostgreSQL',
-        'Microsoft.ContainerService'
+        'Microsoft.AVS',
+        'Microsoft.Compute',
+        'Microsoft.ClassicCompute',
+        'Microsoft.DevCenter',
+        'Microsoft.StorageCache',
+        'Microsoft.MachineLearningServices',
+        'Microsoft.DevOpsInfrastructure',
+        'Microsoft.Fabric',
+        'Microsoft.Network',
+        'Microsoft.Search',
+        'Microsoft.Storage',
+        'Microsoft.ClassicStorage'
     ),
 
     [Parameter()]
