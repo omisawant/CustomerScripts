@@ -3,14 +3,14 @@
 Exports Azure quota limits and current utilization to an Excel workbook.
 
 .DESCRIPTION
-Uses the Azure Quota API cmdlets to collect quota limits (Get-AzQuota) and
-current usage (Get-AzQuotaUsage) for every accessible Azure subscription.
-The workbook contains a summary, one worksheet per quota resource provider,
-and an errors worksheet. Only Azure regions located in the United States are
-queried.
+Uses each Azure service's provider-native usage API to collect current usage
+and limits for every accessible Azure subscription. Microsoft.Quota does not
+need to be registered. The workbook contains a summary, one worksheet per
+resource provider, and an errors worksheet. Only Azure regions located in the
+United States are queried.
 
-Quota availability varies by resource provider and region. Providers that do
-not expose data through the centralized Azure Quota API are recorded in the
+Quota availability varies by resource provider and region. Providers without
+a documented native usage API are recorded once per subscription in the
 Errors worksheet. Supply -QuotaProvider to override the default provider list.
 
 .PARAMETER OutputPath
@@ -209,6 +209,209 @@ function Invoke-QuotaCommand {
     }
 }
 
+function Get-NativeUsagePath {
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $Provider,
+
+        [Parameter(Mandatory)]
+        [string] $AzureLocation
+    )
+
+    $basePath = "/subscriptions/$SubscriptionId/providers/$Provider/locations/$AzureLocation"
+    switch ($Provider) {
+        'Microsoft.Compute' {
+            return "$basePath/usages?api-version=2026-04-01"
+        }
+        'Microsoft.Network' {
+            return "$basePath/usages?api-version=2026-01-01"
+        }
+        'Microsoft.Storage' {
+            return "$basePath/usages?api-version=2025-06-01"
+        }
+        'Microsoft.ContainerInstance' {
+            return "$basePath/usages?api-version=2026-07-01"
+        }
+        'Microsoft.App' {
+            return "$basePath/usages?api-version=2025-07-01"
+        }
+        'Microsoft.Web' {
+            return "$basePath/usages?api-version=2026-07-15"
+        }
+        'Microsoft.Search' {
+            return "$basePath/usages?api-version=2025-05-01"
+        }
+        'Microsoft.DBforPostgreSQL' {
+            return "$basePath/resourceType/flexibleServers/usages?api-version=2026-10-01"
+        }
+        'Microsoft.MachineLearningServices' {
+            return "$basePath/usages?api-version=2026-05-01"
+        }
+        'Microsoft.HDInsight' {
+            return "$basePath/usages?api-version=2021-06-01"
+        }
+        'Microsoft.LabServices' {
+            return "$basePath/usages?api-version=2023-06-07"
+        }
+        'Microsoft.DevCenter' {
+            return "$basePath/usages?api-version=2025-02-01"
+        }
+        'Microsoft.StorageCache' {
+            return "$basePath/usages?api-version=2026-08-01"
+        }
+        'Microsoft.DevOpsInfrastructure' {
+            return "$basePath/usages?api-version=2026-06-02"
+        }
+        default {
+            return $null
+        }
+    }
+}
+
+function Get-AzRestCollection {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    $items = [System.Collections.Generic.List[object]]::new()
+    $nextRequest = $Path
+
+    while ($nextRequest) {
+        $request = $nextRequest
+        $response = Invoke-QuotaCommand -ScriptBlock {
+            if ([uri]::IsWellFormedUriString($request, [System.UriKind]::Absolute)) {
+                Invoke-AzRestMethod -Method GET -Uri $request -ErrorAction Stop
+            }
+            else {
+                Invoke-AzRestMethod -Method GET -Path $request -ErrorAction Stop
+            }
+        }
+
+        if ([int] $response.StatusCode -lt 200 -or [int] $response.StatusCode -ge 300) {
+            throw "Azure Resource Manager returned HTTP $($response.StatusCode): $($response.Content)"
+        }
+
+        if ([string]::IsNullOrWhiteSpace([string] $response.Content)) {
+            break
+        }
+
+        $body = $response.Content | ConvertFrom-Json
+        foreach ($item in @($body.value)) {
+            if ($null -ne $item) {
+                $items.Add($item)
+            }
+        }
+
+        $nextRequest = Get-FirstPropertyValue -InputObject $body -Path @(
+            'nextLink',
+            'NextLink'
+        )
+    }
+
+    return $items.ToArray()
+}
+
+function ConvertTo-QuotaRow {
+    param(
+        [Parameter(Mandatory)]
+        [object] $Subscription,
+
+        [Parameter(Mandatory)]
+        [string] $Provider,
+
+        [Parameter(Mandatory)]
+        [string] $AzureLocation,
+
+        [Parameter(Mandatory)]
+        [object] $Usage,
+
+        [Parameter(Mandatory)]
+        [double] $WarningThreshold
+    )
+
+    $resourceName = Get-FirstPropertyValue -InputObject $Usage -Path @(
+        'name.value',
+        'Name.Value',
+        'name',
+        'Name'
+    )
+    $localizedName = Get-FirstPropertyValue -InputObject $Usage -Path @(
+        'name.localizedValue',
+        'Name.LocalizedValue'
+    )
+    $currentUsage = ConvertTo-NullableDouble -Value (
+        Get-FirstPropertyValue -InputObject $Usage -Path @(
+            'currentValue',
+            'CurrentValue'
+        )
+    )
+    $limit = ConvertTo-NullableDouble -Value (
+        Get-FirstPropertyValue -InputObject $Usage -Path @(
+            'limit',
+            'Limit'
+        )
+    )
+    $unit = Get-FirstPropertyValue -InputObject $Usage -Path @('unit', 'Unit')
+
+    $remaining = $null
+    $utilizationPercent = $null
+    if ($null -ne $limit -and $limit -ge 0 -and $null -ne $currentUsage) {
+        $remaining = $limit - $currentUsage
+        if ($limit -gt 0) {
+            $utilizationPercent = [math]::Round(
+                ($currentUsage / $limit) * 100,
+                2
+            )
+        }
+        elseif ($currentUsage -eq 0) {
+            $utilizationPercent = 0
+        }
+    }
+
+    if ($limit -eq -1) {
+        $status = 'Unlimited'
+    }
+    elseif ($null -eq $limit) {
+        $status = 'Usage only'
+    }
+    elseif ($null -eq $currentUsage) {
+        $status = 'Limit only'
+    }
+    elseif ($limit -gt 0 -and $currentUsage -ge $limit) {
+        $status = 'Exhausted'
+    }
+    elseif ($null -ne $utilizationPercent -and
+        $utilizationPercent -ge $WarningThreshold) {
+        $status = 'Warning'
+    }
+    else {
+        $status = 'OK'
+    }
+
+    return [pscustomobject] @{
+        SubscriptionName   = $Subscription.Name
+        SubscriptionId     = $Subscription.Id
+        TenantId           = $Subscription.TenantId
+        Provider           = $Provider
+        Location           = $AzureLocation
+        QuotaName          = [string] $resourceName
+        QuotaDisplayName   = $localizedName
+        Unit               = $unit
+        CurrentUsage       = $currentUsage
+        Limit              = $limit
+        Remaining          = $remaining
+        UtilizationPercent = $utilizationPercent
+        Status             = $status
+        IsQuotaApplicable  = $true
+        DataSource         = 'Provider-native usage API'
+        CollectedAtUtc     = [datetime]::UtcNow
+    }
+}
+
 function Get-WorksheetName {
     param(
         [Parameter(Mandatory)]
@@ -275,7 +478,7 @@ function Add-CollectionError {
         })
 }
 
-foreach ($moduleName in @('Az.Accounts', 'Az.Resources', 'Az.Quota', 'ImportExcel')) {
+foreach ($moduleName in @('Az.Accounts', 'Az.Resources', 'ImportExcel')) {
     Import-Dependency -Name $moduleName
 }
 
@@ -407,182 +610,142 @@ foreach ($subscription in $subscriptions) {
         $providerIndex++
         $providerStartCount = $quotaRowsByProvider[$provider].Count
         $providerStartErrorCount = $errors.Count
-        $locationsWithData = 0
-        $locationIndex = 0
+        $scopesQueried = 0
+        $scopesWithData = 0
 
-        foreach ($azureLocation in $subscriptionLocations) {
-            $locationIndex++
-            $locationFraction = if ($subscriptionLocations.Count -gt 0) {
-                ($locationIndex - 1) / $subscriptionLocations.Count
-            }
-            else {
-                0
-            }
-            $subscriptionFraction = (
-                ($providerIndex - 1) + $locationFraction
-            ) / $QuotaProvider.Count
-            $overallFraction = (
-                ($subscriptionIndex - 1) + $subscriptionFraction
-            ) / $subscriptions.Count
-            $progressPercent = [math]::Min(
-                94,
-                [math]::Floor($overallFraction * 95)
-            )
-            $progressStatus = (
-                "Subscription {0}/{1} | Provider {2}/{3} | Location {4}/{5} | Elapsed {6}" -f
-                $subscriptionIndex,
-                $subscriptions.Count,
-                $providerIndex,
-                $QuotaProvider.Count,
-                $locationIndex,
-                $subscriptionLocations.Count,
-                $progressTimer.Elapsed.ToString('hh\:mm\:ss')
-            )
-            Write-Progress -Id 0 -Activity 'Collecting Azure quota utilization' `
-                -Status $progressStatus `
-                -CurrentOperation "$provider in $azureLocation" `
-                -PercentComplete $progressPercent
-
-            $scope = "subscriptions/$($subscription.Id)/providers/$provider/locations/$azureLocation"
-            $quotas = @()
-            $usages = @()
-
+        if ($provider -eq 'Microsoft.Automation') {
             try {
-                $quotas = @(Invoke-QuotaCommand -ScriptBlock {
-                        Get-AzQuota -Scope $scope -ErrorAction Stop
-                    })
-            }
-            catch {
-                Add-CollectionError -ErrorList $errors -Subscription $subscription `
-                    -Provider $provider -AzureLocation $azureLocation `
-                    -Operation 'Get-AzQuota' -Message $_.Exception.Message
-            }
-
-            try {
-                $usages = @(Invoke-QuotaCommand -ScriptBlock {
-                        Get-AzQuotaUsage -Scope $scope -ErrorAction Stop
-                    })
-            }
-            catch {
-                Add-CollectionError -ErrorList $errors -Subscription $subscription `
-                    -Provider $provider -AzureLocation $azureLocation `
-                    -Operation 'Get-AzQuotaUsage' -Message $_.Exception.Message
-            }
-
-            $quotaByName = @{}
-            foreach ($quota in $quotas) {
-                $quotaName = Get-FirstPropertyValue -InputObject $quota -Path @('Name', 'Name.Value')
-                if ($null -ne $quotaName) {
-                    $quotaByName[[string] $quotaName] = $quota
-                }
-            }
-
-            $usageByName = @{}
-            foreach ($usage in $usages) {
-                $usageName = Get-FirstPropertyValue -InputObject $usage -Path @('Name', 'Name.Value')
-                if ($null -ne $usageName) {
-                    $usageByName[[string] $usageName] = $usage
-                }
-            }
-
-            $resourceNames = @(
-                @($quotaByName.Keys) + @($usageByName.Keys) |
-                    Sort-Object -Unique
-            )
-
-            if ($resourceNames.Count -gt 0) {
-                $locationsWithData++
-            }
-
-            foreach ($resourceName in $resourceNames) {
-                $quota = $quotaByName[$resourceName]
-                $usage = $usageByName[$resourceName]
-
-                $limit = ConvertTo-NullableDouble -Value (
-                    Get-FirstPropertyValue -InputObject $quota -Path @('LimitValue', 'Limit.Value')
+                $automationAccounts = @(
+                    Get-AzResource -ResourceType 'Microsoft.Automation/automationAccounts' `
+                        -ErrorAction Stop
                 )
-                $currentUsage = ConvertTo-NullableDouble -Value (
-                    Get-FirstPropertyValue -InputObject $usage -Path @(
-                        'UsageValue',
-                        'Usage.Value',
-                        'Usages.Value'
+            }
+            catch {
+                Add-CollectionError -ErrorList $errors -Subscription $subscription `
+                    -Provider $provider -AzureLocation '' `
+                    -Operation 'List Automation accounts' -Message $_.Exception.Message
+                $automationAccounts = @()
+            }
+
+            $accountIndex = 0
+            foreach ($account in $automationAccounts) {
+                $accountIndex++
+                $scopesQueried++
+                Write-Progress -Id 0 -Activity 'Collecting Azure quota utilization' `
+                    -Status "Subscription $subscriptionIndex/$($subscriptions.Count) | Provider $providerIndex/$($QuotaProvider.Count)" `
+                    -CurrentOperation "Automation account $accountIndex/$($automationAccounts.Count): $($account.Name)" `
+                    -PercentComplete $subscriptionBasePercent
+
+                try {
+                    $usages = @(
+                        Get-AzRestCollection -Path (
+                            "$($account.ResourceId)/usages?api-version=2024-10-23"
+                        )
                     )
-                )
+                    if ($usages.Count -gt 0) {
+                        $scopesWithData++
+                    }
 
-                $remaining = $null
-                $utilizationPercent = $null
-                if ($null -ne $limit -and $null -ne $currentUsage) {
-                    $remaining = $limit - $currentUsage
-                    if ($limit -gt 0) {
-                        $utilizationPercent = [math]::Round(
-                            ($currentUsage / $limit) * 100,
-                            2
+                    foreach ($usage in $usages) {
+                        $quotaRowsByProvider[$provider].Add(
+                            (ConvertTo-QuotaRow -Subscription $subscription `
+                                -Provider $provider -AzureLocation $account.Location `
+                                -Usage $usage `
+                                -WarningThreshold $WarningThresholdPercent)
                         )
                     }
-                    elseif ($currentUsage -eq 0) {
-                        $utilizationPercent = 0
+                }
+                catch {
+                    Add-CollectionError -ErrorList $errors -Subscription $subscription `
+                        -Provider $provider -AzureLocation $account.Location `
+                        -Operation "Get native usage for $($account.Name)" `
+                        -Message $_.Exception.Message
+                }
+            }
+        }
+        else {
+            $samplePath = Get-NativeUsagePath -SubscriptionId $subscription.Id `
+                -Provider $provider -AzureLocation $subscriptionLocations[0]
+
+            if ($null -eq $samplePath) {
+                $unsupportedMessage = switch ($provider) {
+                    'Microsoft.ContainerService' {
+                        'AKS has no provider-native quota listing API. AKS consumes quotas reported in the Microsoft.Compute and Microsoft.Network worksheets.'
+                    }
+                    'Microsoft.AVS' {
+                        'AVS exposes quota availability, but not current usage and limit values in a native usage-list API.'
+                    }
+                    default {
+                        "Provider '$provider' has no documented provider-native usage and limit listing API."
                     }
                 }
 
-                if ($null -eq $limit) {
-                    $status = 'Usage only'
-                }
-                elseif ($null -eq $currentUsage) {
-                    $status = 'Limit only'
-                }
-                elseif ($limit -gt 0 -and $currentUsage -ge $limit) {
-                    $status = 'Exhausted'
-                }
-                elseif ($null -ne $utilizationPercent -and
-                    $utilizationPercent -ge $WarningThresholdPercent) {
-                    $status = 'Warning'
-                }
-                else {
-                    $status = 'OK'
-                }
-
-                $localizedName = Get-FirstPropertyValue -InputObject $quota -Path @(
-                    'NameLocalizedValue',
-                    'Name.LocalizedValue'
-                )
-                if ($null -eq $localizedName) {
-                    $localizedName = Get-FirstPropertyValue -InputObject $usage -Path @(
-                        'NameLocalizedValue',
-                        'Name.LocalizedValue'
+                Add-CollectionError -ErrorList $errors -Subscription $subscription `
+                    -Provider $provider -AzureLocation '' `
+                    -Operation 'Native quota API not available' `
+                    -Message $unsupportedMessage
+            }
+            else {
+                $locationIndex = 0
+                foreach ($azureLocation in $subscriptionLocations) {
+                    $locationIndex++
+                    $scopesQueried++
+                    $locationFraction = (
+                        $locationIndex - 1
+                    ) / [math]::Max(1, $subscriptionLocations.Count)
+                    $subscriptionFraction = (
+                        ($providerIndex - 1) + $locationFraction
+                    ) / $QuotaProvider.Count
+                    $overallFraction = (
+                        ($subscriptionIndex - 1) + $subscriptionFraction
+                    ) / $subscriptions.Count
+                    $progressPercent = [math]::Min(
+                        94,
+                        [math]::Floor($overallFraction * 95)
                     )
-                }
-
-                $unit = Get-FirstPropertyValue -InputObject $quota -Path @('Unit')
-                if ($null -eq $unit) {
-                    $unit = Get-FirstPropertyValue -InputObject $usage -Path @('Unit')
-                }
-
-                $isQuotaApplicable = Get-FirstPropertyValue -InputObject $quota -Path @(
-                    'IsQuotaApplicable'
-                )
-                if ($null -eq $isQuotaApplicable) {
-                    $isQuotaApplicable = Get-FirstPropertyValue -InputObject $usage -Path @(
-                        'IsQuotaApplicable'
+                    $progressStatus = (
+                        "Subscription {0}/{1} | Provider {2}/{3} | Location {4}/{5} | Elapsed {6}" -f
+                        $subscriptionIndex,
+                        $subscriptions.Count,
+                        $providerIndex,
+                        $QuotaProvider.Count,
+                        $locationIndex,
+                        $subscriptionLocations.Count,
+                        $progressTimer.Elapsed.ToString('hh\:mm\:ss')
                     )
-                }
+                    Write-Progress -Id 0 -Activity 'Collecting Azure quota utilization' `
+                        -Status $progressStatus `
+                        -CurrentOperation "$provider in $azureLocation" `
+                        -PercentComplete $progressPercent
 
-                $quotaRowsByProvider[$provider].Add([pscustomobject] @{
-                        SubscriptionName   = $subscription.Name
-                        SubscriptionId     = $subscription.Id
-                        TenantId           = $subscription.TenantId
-                        Provider           = $provider
-                        Location           = $azureLocation
-                        QuotaName          = [string] $resourceName
-                        QuotaDisplayName   = $localizedName
-                        Unit               = $unit
-                        CurrentUsage       = $currentUsage
-                        Limit              = $limit
-                        Remaining          = $remaining
-                        UtilizationPercent = $utilizationPercent
-                        Status             = $status
-                        IsQuotaApplicable  = $isQuotaApplicable
-                        CollectedAtUtc     = [datetime]::UtcNow
-                    })
+                    $path = Get-NativeUsagePath -SubscriptionId $subscription.Id `
+                        -Provider $provider -AzureLocation $azureLocation
+                    try {
+                        $usages = @(Get-AzRestCollection -Path $path)
+                        if ($usages.Count -gt 0) {
+                            $scopesWithData++
+                        }
+
+                        foreach ($usage in $usages) {
+                            $quotaRowsByProvider[$provider].Add(
+                                (ConvertTo-QuotaRow -Subscription $subscription `
+                                    -Provider $provider -AzureLocation $azureLocation `
+                                    -Usage $usage `
+                                    -WarningThreshold $WarningThresholdPercent)
+                            )
+                        }
+                    }
+                    catch {
+                        Add-CollectionError -ErrorList $errors -Subscription $subscription `
+                            -Provider $provider -AzureLocation $azureLocation `
+                            -Operation 'Get provider-native usage' `
+                            -Message $_.Exception.Message
+
+                        if ($_.Exception.Message -match 'MissingSubscriptionRegistration') {
+                            break
+                        }
+                    }
+                }
             }
         }
 
@@ -610,8 +773,8 @@ foreach ($subscription in $subscriptions) {
                 SubscriptionId           = $subscription.Id
                 TenantId                 = $subscription.TenantId
                 Provider                 = $provider
-                LocationsQueried         = $subscriptionLocations.Count
-                LocationsWithData        = $locationsWithData
+                ScopesQueried             = $scopesQueried
+                ScopesWithData            = $scopesWithData
                 QuotaRecords             = $providerRows.Count
                 WarningOrExhausted       = $warningCount
                 MaximumUtilizationPercent = $maximumUtilization
